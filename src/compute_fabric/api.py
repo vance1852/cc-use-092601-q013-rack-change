@@ -63,6 +63,32 @@ class JsonApplication:
                 return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
             if method == "POST" and path == "/facilities":
                 return Response(201, self.service.create_facility(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[0] == "facilities" and parts[2] == "constraints":
+                return Response(200, self.service.facility_constraints(parts[1]))
+            if method == "PUT" and len(parts) == 3 and parts[0] == "facilities" and parts[2] == "constraints":
+                return Response(200, self.service.upsert_facility_constraint(actor, parts[1], payload))
+            if method == "POST" and path == "/rack-changes":
+                return Response(201, self.service.submit_rack_change(actor, payload))
+            if method == "GET" and path == "/rack-changes":
+                facility_id = query.get("facility_id", [None])[0]
+                return Response(200, self.service.list_rack_changes(facility_id))
+            if method == "GET" and len(parts) == 2 and parts[0] == "rack-changes":
+                revision = query.get("revision", [None])[0]
+                return Response(200, self.service.rack_change(parts[1], None if revision is None else int(revision)))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "approve":
+                return Response(200, self.service.approve_rack_change(actor, parts[1], int(payload["expected_revision"]), payload["basis"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "reject":
+                return Response(200, self.service.reject_rack_change(actor, parts[1], int(payload["expected_revision"]), payload["basis"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "cancel":
+                return Response(200, self.service.cancel_rack_change(actor, parts[1], payload.get("note", "")))
+            if method == "POST" and len(parts) == 4 and parts[0] == "rack-changes" and parts[2] == "steps":
+                return Response(200, self.service.confirm_step(actor, parts[1], int(parts[3]), payload.get("note", "")))
+            if method == "POST" and len(parts) == 5 and parts[0] == "rack-changes" and parts[2] == "steps" and parts[4] == "fail":
+                return Response(200, self.service.fail_step(actor, parts[1], int(parts[3]), payload["reason"], payload.get("mode", "rollback")))
+            if method == "POST" and len(parts) == 5 and parts[0] == "rack-changes" and parts[2] == "steps" and parts[4] == "rollback":
+                return Response(200, self.service.record_rollback_step(actor, parts[1], int(parts[3]), payload.get("note", "")))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "manual-resolution":
+                return Response(200, self.service.resolve_manual_takeover(actor, parts[1], payload["outcome"], payload["note"]))
             if method == "POST" and path == "/routes":
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
@@ -100,6 +126,9 @@ def make_handler(application: JsonApplication):
             self._dispatch()
 
         def do_POST(self) -> None:  # noqa: N802
+            self._dispatch()
+
+        def do_PUT(self) -> None:  # noqa: N802
             self._dispatch()
 
         def _dispatch(self) -> None:

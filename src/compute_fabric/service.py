@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario, decimal_value, required_text
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -27,14 +27,30 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .rack_change import (
+    VISIBLE_STATES,
+    RackChangeDraft,
+    build_impact,
+    normalize_constraint_key,
+    required_demands,
+    unit_for,
+)
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "rack_change.read"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "risk": {"outage.write", "scenario.approve", "report.read", "rack_change.approve", "rack_change.read"},
+    "auditor": {"report.read", "audit.read", "rack_change.read"},
+    "facilities": {
+        "constraint.write",
+        "rack_change.write",
+        "rack_change.approve",
+        "rack_change.execute",
+        "rack_change.read",
+        "report.read",
+    },
 }
 
 
@@ -547,6 +563,691 @@ class SupplyService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    # ------------------------------------------------------------------
+    # 设施约束容量目录
+    # ------------------------------------------------------------------
+
+    def upsert_facility_constraint(self, actor_id: str, facility_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "constraint.write")
+        if self.connection.execute("SELECT 1 FROM facilities WHERE facility_id=?", (facility_id,)).fetchone() is None:
+            raise NotFound("设施不存在")
+        constraint_key = normalize_constraint_key(raw.get("constraint_key"))
+        capacity = decimal_value(raw.get("capacity"), "capacity", minimum=Decimal("0"))
+        unit = required_text(raw.get("unit"), "unit", 16) if raw.get("unit") else unit_for(constraint_key)
+        with transaction(self.connection, immediate=True):
+            existing = self.connection.execute(
+                "SELECT * FROM facility_constraints WHERE facility_id=? AND constraint_key=?",
+                (facility_id, constraint_key),
+            ).fetchone()
+            if existing is None:
+                self.connection.execute(
+                    "INSERT INTO facility_constraints(facility_id,constraint_key,unit,capacity,used,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (facility_id, constraint_key, unit, decimal_text(capacity), "0", self._now()),
+                )
+            else:
+                locked_total = Decimal(existing["used"]) + Decimal(existing["reserved"])
+                if capacity < locked_total:
+                    raise Conflict("容量不能小于已用与已锁定余量之和")
+                self.connection.execute(
+                    "UPDATE facility_constraints SET capacity=?,unit=?,revision=revision+1 "
+                    "WHERE facility_id=? AND constraint_key=?",
+                    (decimal_text(capacity), unit, facility_id, constraint_key),
+                )
+            self._audit(
+                "facility_constraint",
+                f"{facility_id}:{constraint_key}",
+                "constraint.upserted",
+                actor_id,
+                {"facility_id": facility_id, "constraint_key": constraint_key, "capacity": decimal_text(capacity)},
+            )
+        return self.facility_constraints(facility_id)
+
+    def facility_constraints(self, facility_id: str) -> dict[str, Any]:
+        rows = self.connection.execute(
+            "SELECT * FROM facility_constraints WHERE facility_id=? ORDER BY constraint_key",
+            (facility_id,),
+        ).fetchall()
+        items = []
+        for row in rows:
+            capacity = Decimal(row["capacity"])
+            used = Decimal(row["used"])
+            reserved = Decimal(row["reserved"])
+            items.append(
+                {
+                    "constraint_key": row["constraint_key"],
+                    "unit": row["unit"],
+                    "capacity": decimal_text(capacity),
+                    "used": decimal_text(used),
+                    "reserved": decimal_text(reserved),
+                    "remaining": decimal_text(quantize_volume(capacity - used - reserved)),
+                    "revision": row["revision"],
+                }
+            )
+        return {"facility_id": facility_id, "constraints": items}
+
+    # ------------------------------------------------------------------
+    # 机柜上架变更
+    # ------------------------------------------------------------------
+
+    def _facility_snapshot(self, facility_id: str, exclude_change: str | None = None) -> dict[str, Any]:
+        constraints = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT facility_id,constraint_key,unit,capacity,used,reserved,revision "
+                "FROM facility_constraints WHERE facility_id=? ORDER BY constraint_key",
+                (facility_id,),
+            ).fetchall()
+        ]
+        placeholders = ",".join("?" for _ in VISIBLE_STATES)
+        rows = self.connection.execute(
+            f"SELECT * FROM rack_changes WHERE facility_id=? AND state IN ({placeholders}) ORDER BY change_id,revision",
+            (facility_id, *sorted(VISIBLE_STATES)),
+        ).fetchall()
+        others: list[dict[str, Any]] = []
+        for row in rows:
+            if exclude_change is not None and row["change_id"] == exclude_change:
+                continue
+            others.append(
+                {
+                    "change_id": row["change_id"],
+                    "revision": row["revision"],
+                    "state": row["state"],
+                    "window_starts_at": row["window_starts_at"],
+                    "window_ends_at": row["window_ends_at"],
+                    "demands": [
+                        {"constraint_key": item["constraint_key"], "required_value": item["required_value"]}
+                        for item in self.connection.execute(
+                            "SELECT constraint_key,required_value FROM rack_change_demands "
+                            "WHERE change_id=? AND revision=? ORDER BY constraint_key",
+                            (row["change_id"], row["revision"]),
+                        ).fetchall()
+                    ],
+                    "locations": [
+                        {"rack_id": item["rack_id"], "u_start": item["u_start"], "u_size": item["u_size"]}
+                        for item in self.connection.execute(
+                            "SELECT rack_id,u_start,u_size FROM rack_change_locations "
+                            "WHERE change_id=? AND revision=? ORDER BY rack_id,u_start",
+                            (row["change_id"], row["revision"]),
+                        ).fetchall()
+                    ],
+                }
+            )
+        return {"facility_id": facility_id, "constraints": constraints, "others": others}
+
+    def _recompute_impact(self, draft: RackChangeDraft, demands: Mapping[str, Decimal], exclude_change: str) -> dict[str, Any]:
+        snapshot = self._facility_snapshot(draft.facility_id, exclude_change)
+        locations = [location.as_dict() for location in draft.locations]
+        window = {"starts_at": draft.window_starts_at, "ends_at": draft.window_ends_at}
+        impact = build_impact(snapshot, draft.change_id, demands, locations, window)
+        impact["snapshot_sha256"] = digest({"constraints": snapshot["constraints"], "others": snapshot["others"]})
+        return impact
+
+    def submit_rack_change(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.write")
+        draft = RackChangeDraft.from_dict(raw)
+        if self.connection.execute("SELECT 1 FROM facilities WHERE facility_id=?", (draft.facility_id,)).fetchone() is None:
+            raise NotFound("设施不存在")
+        demands = required_demands(draft)
+        content = draft.content()
+        content_sha256 = digest(content)
+        with transaction(self.connection, immediate=True):
+            latest = self.connection.execute(
+                "SELECT * FROM rack_changes WHERE change_id=? ORDER BY revision DESC LIMIT 1",
+                (draft.change_id,),
+            ).fetchone()
+            revision = 1
+            if latest is not None:
+                if latest["state"] not in {"submitted", "rejected"}:
+                    raise InvalidState("当前版本不处于可修订状态")
+                revision = int(latest["revision"]) + 1
+                if latest["state"] == "submitted" and latest["content_sha256"] == content_sha256:
+                    return self.rack_change(draft.change_id, int(latest["revision"]))
+            impact = self._recompute_impact(draft, demands, draft.change_id)
+            self.connection.execute(
+                "INSERT INTO rack_changes(change_id,revision,facility_id,title,bom_version,content_json,"
+                "content_sha256,state,window_starts_at,window_ends_at,submitted_by,supersedes_revision,"
+                "impact_json,impact_built_at,snapshot_sha256,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    draft.change_id,
+                    revision,
+                    draft.facility_id,
+                    draft.title,
+                    draft.bom_version,
+                    canonical_json(content),
+                    content_sha256,
+                    "submitted",
+                    draft.window_starts_at,
+                    draft.window_ends_at,
+                    actor_id,
+                    None if latest is None else int(latest["revision"]),
+                    canonical_json(impact),
+                    self._now(),
+                    impact["snapshot_sha256"],
+                    self._now(),
+                ),
+            )
+            if latest is not None and latest["state"] == "submitted":
+                self.connection.execute(
+                    "UPDATE rack_changes SET state='superseded' WHERE change_id=? AND revision=? AND state='submitted'",
+                    (draft.change_id, int(latest["revision"])),
+                )
+            for key, value in demands.items():
+                self.connection.execute(
+                    "INSERT INTO rack_change_demands(change_id,revision,constraint_key,unit,required_value) "
+                    "VALUES(?,?,?,?,?)",
+                    (draft.change_id, revision, key, unit_for(key), decimal_text(value)),
+                )
+            for location in draft.locations:
+                self.connection.execute(
+                    "INSERT INTO rack_change_locations(change_id,revision,rack_id,u_start,u_size) VALUES(?,?,?,?,?)",
+                    (draft.change_id, revision, location.rack_id, location.u_start, location.u_size),
+                )
+            for step in draft.steps:
+                self.connection.execute(
+                    "INSERT INTO rack_change_steps(change_id,revision,sequence,name,rollback_action) VALUES(?,?,?,?,?)",
+                    (draft.change_id, revision, step.sequence, step.name, step.rollback_action),
+                )
+            self._audit(
+                "rack_change",
+                draft.change_id,
+                "rack_change.submitted",
+                actor_id,
+                {"revision": revision, "bom_version": draft.bom_version, "feasible": impact["feasible"]},
+            )
+        return self.rack_change(draft.change_id, revision)
+
+    def _revision_row(self, change_id: str, revision: int | None) -> sqlite3.Row:
+        if revision is None:
+            row = self.connection.execute(
+                "SELECT * FROM rack_changes WHERE change_id=? ORDER BY revision DESC LIMIT 1",
+                (change_id,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT * FROM rack_changes WHERE change_id=? AND revision=?",
+                (change_id, revision),
+            ).fetchone()
+        if row is None:
+            raise NotFound("机柜上架变更不存在")
+        return row
+
+    def rack_change(self, change_id: str, revision: int | None = None) -> dict[str, Any]:
+        row = self._revision_row(change_id, revision)
+        revisions = [
+            {
+                "revision": item["revision"],
+                "state": item["state"],
+                "bom_version": item["bom_version"],
+                "content_sha256": item["content_sha256"],
+                "supersedes_revision": item["supersedes_revision"],
+                "submitted_by": item["submitted_by"],
+                "created_at": item["created_at"],
+                "decision_by": item["decision_by"],
+                "decision_at": item["decision_at"],
+                "decision_basis": item["decision_basis"],
+                "fail_reason": item["fail_reason"],
+            }
+            for item in self.connection.execute(
+                "SELECT revision,state,bom_version,content_sha256,supersedes_revision,submitted_by,created_at,"
+                "decision_by,decision_at,decision_basis,fail_reason FROM rack_changes WHERE change_id=? ORDER BY revision",
+                (change_id,),
+            ).fetchall()
+        ]
+        steps = [
+            {
+                "sequence": item["sequence"],
+                "name": item["name"],
+                "rollback_action": item["rollback_action"],
+                "state": item["state"],
+                "receipt_by": item["receipt_by"],
+                "receipt_note": item["receipt_note"],
+                "completed_at": item["completed_at"],
+            }
+            for item in self.connection.execute(
+                "SELECT sequence,name,rollback_action,state,receipt_by,receipt_note,completed_at "
+                "FROM rack_change_steps WHERE change_id=? AND revision=? ORDER BY sequence",
+                (change_id, row["revision"]),
+            ).fetchall()
+        ]
+        reservations = [
+            dict(item)
+            for item in self.connection.execute(
+                "SELECT constraint_key,reserved_value,released_value,state,locked_at,released_at "
+                "FROM rack_change_reservations WHERE change_id=? AND revision=? ORDER BY constraint_key",
+                (change_id, row["revision"]),
+            ).fetchall()
+        ]
+        if row["state"] == "submitted":
+            # 待批版本按当前快照实时展示剩余量与冲突；批准后展示锁定时快照。
+            impact = self._stored_impact(row)
+            impact["freshness"] = "live"
+        else:
+            impact = json.loads(row["impact_json"])
+            impact["freshness"] = "locked_at_decision"
+        return {
+            "change_id": change_id,
+            "revision": row["revision"],
+            "facility_id": row["facility_id"],
+            "title": row["title"],
+            "bom_version": row["bom_version"],
+            "state": row["state"],
+            "submitted_by": row["submitted_by"],
+            "window_starts_at": row["window_starts_at"],
+            "window_ends_at": row["window_ends_at"],
+            "content": json.loads(row["content_json"]),
+            "impact": impact,
+            "decision": {
+                "by": row["decision_by"],
+                "at": row["decision_at"],
+                "basis": row["decision_basis"],
+                "snapshot_sha256": row["snapshot_sha256"],
+            },
+            "fail_reason": row["fail_reason"],
+            "steps": steps,
+            "reservations": reservations,
+            "revisions": revisions,
+        }
+
+    def list_rack_changes(self, facility_id: str | None = None) -> dict[str, Any]:
+        if facility_id is None:
+            rows = self.connection.execute(
+                "SELECT * FROM rack_changes r WHERE revision=(SELECT max(revision) FROM rack_changes WHERE change_id=r.change_id) "
+                "ORDER BY change_id"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM rack_changes r WHERE facility_id=? AND revision="
+                "(SELECT max(revision) FROM rack_changes WHERE change_id=r.change_id) ORDER BY change_id",
+                (facility_id,),
+            ).fetchall()
+        return {
+            "changes": [
+                {
+                    "change_id": row["change_id"],
+                    "revision": row["revision"],
+                    "facility_id": row["facility_id"],
+                    "title": row["title"],
+                    "state": row["state"],
+                    "submitted_by": row["submitted_by"],
+                    "window_starts_at": row["window_starts_at"],
+                    "window_ends_at": row["window_ends_at"],
+                    "feasible": json.loads(row["impact_json"])["feasible"],
+                }
+                for row in rows
+            ]
+        }
+
+    def _stored_impact(self, row: sqlite3.Row) -> dict[str, Any]:
+        demands = {
+            item["constraint_key"]: Decimal(item["required_value"])
+            for item in self.connection.execute(
+                "SELECT constraint_key,required_value FROM rack_change_demands WHERE change_id=? AND revision=?",
+                (row["change_id"], row["revision"]),
+            ).fetchall()
+        }
+        locations = [
+            dict(item)
+            for item in self.connection.execute(
+                "SELECT rack_id,u_start,u_size FROM rack_change_locations WHERE change_id=? AND revision=?",
+                (row["change_id"], row["revision"]),
+            ).fetchall()
+        ]
+        snapshot = self._facility_snapshot(row["facility_id"], row["change_id"])
+        window = {"starts_at": row["window_starts_at"], "ends_at": row["window_ends_at"]}
+        impact = build_impact(snapshot, row["change_id"], demands, locations, window)
+        impact["snapshot_sha256"] = digest({"constraints": snapshot["constraints"], "others": snapshot["others"]})
+        return impact
+
+    def _decide_rack_change(
+        self,
+        actor_id: str,
+        change_id: str,
+        expected_revision: int,
+        approved: bool,
+        basis: str,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.approve")
+        basis = basis.strip() if isinstance(basis, str) else ""
+        if not basis:
+            raise ValidationFailed("审批必须给出决定依据")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT * FROM rack_changes WHERE change_id=? AND revision=?",
+                (change_id, expected_revision),
+            ).fetchone()
+            if row is None:
+                raise NotFound("机柜上架变更版本不存在")
+            if row["state"] != "submitted":
+                raise InvalidState("只有待批版本可以审批")
+            if row["submitted_by"] == actor_id:
+                raise Forbidden("申请人不能批准自己的变更")
+            if approved:
+                impact = self._stored_impact(row)
+                if not impact["feasible"]:
+                    raise Conflict("影响分析存在硬性冲突，不能批准锁定")
+                for item in impact["constraints"]:
+                    key = item["constraint_key"]
+                    value = Decimal(item["required"])
+                    constraint = self.connection.execute(
+                        "SELECT * FROM facility_constraints WHERE facility_id=? AND constraint_key=?",
+                        (row["facility_id"], key),
+                    ).fetchone()
+                    if constraint is None:
+                        raise Conflict(f"设施目录缺少约束 {key}")
+                    reserved = Decimal(constraint["reserved"]) + value
+                    self.connection.execute(
+                        "UPDATE facility_constraints SET reserved=?,revision=revision+1 "
+                        "WHERE facility_id=? AND constraint_key=?",
+                        (decimal_text(quantize_volume(reserved)), row["facility_id"], key),
+                    )
+                    self.connection.execute(
+                        "UPDATE rack_change_demands SET snapshot_capacity=?,snapshot_used=?,snapshot_reserved=? "
+                        "WHERE change_id=? AND revision=? AND constraint_key=?",
+                        (
+                            constraint["capacity"],
+                            constraint["used"],
+                            constraint["reserved"],
+                            change_id,
+                            expected_revision,
+                            key,
+                        ),
+                    )
+                    self.connection.execute(
+                        "INSERT INTO rack_change_reservations(change_id,revision,facility_id,constraint_key,"
+                        "reserved_value,locked_at) VALUES(?,?,?,?,?,?)",
+                        (change_id, expected_revision, row["facility_id"], key, decimal_text(value), self._now()),
+                    )
+                new_state = "approved"
+                self.connection.execute(
+                    "UPDATE rack_changes SET impact_json=?,impact_built_at=?,snapshot_sha256=? "
+                    "WHERE change_id=? AND revision=?",
+                    (
+                        canonical_json(impact),
+                        self._now(),
+                        impact["snapshot_sha256"],
+                        change_id,
+                        expected_revision,
+                    ),
+                )
+            else:
+                new_state = "rejected"
+            self.connection.execute(
+                "UPDATE rack_changes SET state=?,decision_by=?,decision_at=?,decision_basis=? "
+                "WHERE change_id=? AND revision=?",
+                (new_state, actor_id, self._now(), basis, change_id, expected_revision),
+            )
+            self._audit(
+                "rack_change",
+                change_id,
+                "rack_change.approved" if approved else "rack_change.rejected",
+                actor_id,
+                {"revision": expected_revision, "basis": basis},
+            )
+        return self.rack_change(change_id, expected_revision)
+
+    def approve_rack_change(self, actor_id: str, change_id: str, expected_revision: int, basis: str) -> dict[str, Any]:
+        return self._decide_rack_change(actor_id, change_id, expected_revision, True, basis)
+
+    def reject_rack_change(self, actor_id: str, change_id: str, expected_revision: int, basis: str) -> dict[str, Any]:
+        return self._decide_rack_change(actor_id, change_id, expected_revision, False, basis)
+
+    def cancel_rack_change(self, actor_id: str, change_id: str, note: str) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.write")
+        with transaction(self.connection, immediate=True):
+            row = self._revision_row(change_id, None)
+            if row["state"] != "submitted":
+                raise InvalidState("只有待批变更可以撤回")
+            if row["submitted_by"] != actor_id:
+                raise Forbidden("只能撤回本人提交的变更")
+            self.connection.execute(
+                "UPDATE rack_changes SET state='cancelled' WHERE change_id=? AND revision=?",
+                (change_id, row["revision"]),
+            )
+            self._audit(
+                "rack_change", change_id, "rack_change.cancelled", actor_id, {"revision": row["revision"], "note": note}
+            )
+        return self.rack_change(change_id, row["revision"])
+
+    def _set_state(self, change_id: str, revision: int, state: str, fail_reason: str | None = None) -> None:
+        self.connection.execute(
+            "UPDATE rack_changes SET state=?,fail_reason=? WHERE change_id=? AND revision=?",
+            (state, fail_reason, change_id, revision),
+        )
+
+    def _release_reservations(self, change_id: str, revision: int) -> None:
+        rows = self.connection.execute(
+            "SELECT * FROM rack_change_reservations WHERE change_id=? AND revision=? AND state='locked'",
+            (change_id, revision),
+        ).fetchall()
+        for row in rows:
+            constraint = self.connection.execute(
+                "SELECT reserved FROM facility_constraints WHERE facility_id=? AND constraint_key=?",
+                (row["facility_id"], row["constraint_key"]),
+            ).fetchone()
+            remaining = quantize_volume(Decimal(constraint["reserved"]) - Decimal(row["reserved_value"]))
+            self.connection.execute(
+                "UPDATE facility_constraints SET reserved=?,revision=revision+1 WHERE facility_id=? AND constraint_key=?",
+                (decimal_text(remaining), row["facility_id"], row["constraint_key"]),
+            )
+            self.connection.execute(
+                "UPDATE rack_change_reservations SET state='released',released_value=reserved_value,released_at=? "
+                "WHERE change_id=? AND revision=? AND constraint_key=?",
+                (self._now(), change_id, revision, row["constraint_key"]),
+            )
+
+    def _consume_reservations(self, change_id: str, revision: int) -> None:
+        rows = self.connection.execute(
+            "SELECT * FROM rack_change_reservations WHERE change_id=? AND revision=? AND state='locked'",
+            (change_id, revision),
+        ).fetchall()
+        for row in rows:
+            constraint = self.connection.execute(
+                "SELECT used,reserved FROM facility_constraints WHERE facility_id=? AND constraint_key=?",
+                (row["facility_id"], row["constraint_key"]),
+            ).fetchone()
+            used = quantize_volume(Decimal(constraint["used"]) + Decimal(row["reserved_value"]))
+            reserved = quantize_volume(Decimal(constraint["reserved"]) - Decimal(row["reserved_value"]))
+            self.connection.execute(
+                "UPDATE facility_constraints SET used=?,reserved=?,revision=revision+1 "
+                "WHERE facility_id=? AND constraint_key=?",
+                (decimal_text(used), decimal_text(reserved), row["facility_id"], row["constraint_key"]),
+            )
+            self.connection.execute(
+                "UPDATE rack_change_reservations SET state='consumed' WHERE change_id=? AND revision=? AND constraint_key=?",
+                (change_id, revision, row["constraint_key"]),
+            )
+
+    def confirm_step(self, actor_id: str, change_id: str, sequence: int, note: str) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.execute")
+        with transaction(self.connection, immediate=True):
+            row = self._revision_row(change_id, None)
+            if row["state"] not in {"approved", "in_progress"}:
+                raise InvalidState("变更未进入可施工状态")
+            steps = self.connection.execute(
+                "SELECT * FROM rack_change_steps WHERE change_id=? AND revision=? ORDER BY sequence",
+                (change_id, row["revision"]),
+            ).fetchall()
+            target = next((item for item in steps if item["sequence"] == sequence), None)
+            if target is None:
+                raise NotFound("实施步骤不存在")
+            if target["state"] != "pending":
+                raise InvalidState("该步骤已经回执，不能重复确认")
+            for item in steps:
+                if item["sequence"] < sequence and item["state"] != "done":
+                    raise InvalidState("必须按步骤顺序回执，前序步骤尚未完成")
+            self.connection.execute(
+                "UPDATE rack_change_steps SET state='done',receipt_by=?,receipt_note=?,completed_at=? "
+                "WHERE change_id=? AND revision=? AND sequence=?",
+                (actor_id, note, self._now(), change_id, row["revision"], sequence),
+            )
+            if row["state"] == "approved":
+                self._set_state(change_id, row["revision"], "in_progress")
+            remaining = self.connection.execute(
+                "SELECT count(*) n FROM rack_change_steps WHERE change_id=? AND revision=? AND state!='done'",
+                (change_id, row["revision"]),
+            ).fetchone()["n"]
+            completed = remaining == 0
+            if completed:
+                self._consume_reservations(change_id, row["revision"])
+                self._set_state(change_id, row["revision"], "completed")
+            self._audit(
+                "rack_change",
+                change_id,
+                "rack_change.step_confirmed",
+                actor_id,
+                {"revision": row["revision"], "sequence": sequence, "completed": completed},
+            )
+        return self.rack_change(change_id, row["revision"])
+
+    def fail_step(
+        self,
+        actor_id: str,
+        change_id: str,
+        sequence: int,
+        reason: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.execute")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationFailed("失败步骤必须记录原因")
+        if mode not in {"rollback", "manual"}:
+            raise ValidationFailed("mode 必须是 rollback 或 manual")
+        with transaction(self.connection, immediate=True):
+            row = self._revision_row(change_id, None)
+            if row["state"] not in {"approved", "in_progress"}:
+                raise InvalidState("变更未处于可施工状态")
+            steps = self.connection.execute(
+                "SELECT * FROM rack_change_steps WHERE change_id=? AND revision=? ORDER BY sequence",
+                (change_id, row["revision"]),
+            ).fetchall()
+            target = next((item for item in steps if item["sequence"] == sequence), None)
+            if target is None:
+                raise NotFound("实施步骤不存在")
+            if target["state"] != "pending":
+                raise InvalidState("只能对待执行步骤登记失败")
+            for item in steps:
+                if item["sequence"] < sequence and item["state"] != "done":
+                    raise InvalidState("失败步骤之前存在未完成步骤，回执顺序不正确")
+            self.connection.execute(
+                "UPDATE rack_change_steps SET state='failed',receipt_by=?,receipt_note=?,completed_at=? "
+                "WHERE change_id=? AND revision=? AND sequence=?",
+                (actor_id, reason, self._now(), change_id, row["revision"], sequence),
+            )
+            # 失败点之后的步骤从未执行，标记 skipped，部分完成绝不能被视为成功。
+            self.connection.execute(
+                "UPDATE rack_change_steps SET state='skipped' WHERE change_id=? AND revision=? "
+                "AND sequence>? AND state='pending'",
+                (change_id, row["revision"], sequence),
+            )
+            new_state = "rolling_back" if mode == "rollback" else "manual_takeover"
+            fail_reason = reason.strip()
+            if mode == "rollback":
+                done_count = self.connection.execute(
+                    "SELECT count(*) n FROM rack_change_steps WHERE change_id=? AND revision=? AND state='done'",
+                    (change_id, row["revision"]),
+                ).fetchone()["n"]
+                if done_count == 0:
+                    # 没有任何步骤落地，直接释放锁定余量并结束为已回退。
+                    self._release_reservations(change_id, row["revision"])
+                    new_state = "rolled_back"
+            self._set_state(change_id, row["revision"], new_state, fail_reason)
+            self._audit(
+                "rack_change",
+                change_id,
+                "rack_change.step_failed",
+                actor_id,
+                {"revision": row["revision"], "sequence": sequence, "mode": mode, "reason": reason.strip()},
+            )
+        return self.rack_change(change_id, row["revision"])
+
+    def record_rollback_step(self, actor_id: str, change_id: str, sequence: int, note: str) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.execute")
+        with transaction(self.connection, immediate=True):
+            row = self._revision_row(change_id, None)
+            if row["state"] != "rolling_back":
+                raise InvalidState("变更不处于回退中")
+            done_steps = self.connection.execute(
+                "SELECT * FROM rack_change_steps WHERE change_id=? AND revision=? AND state='done' ORDER BY sequence",
+                (change_id, row["revision"]),
+            ).fetchall()
+            target = next((item for item in done_steps if item["sequence"] == sequence), None)
+            if target is None:
+                raise InvalidState("该步骤不是待回退的已完成步骤")
+            highest = max(item["sequence"] for item in done_steps)
+            if sequence != highest:
+                raise InvalidState("必须按逆序回退，先回退最近完成的步骤")
+            self.connection.execute(
+                "UPDATE rack_change_steps SET state='rolled_back',receipt_note=? WHERE change_id=? AND revision=? AND sequence=?",
+                (f"回退：{note}", change_id, row["revision"], sequence),
+            )
+            remaining = self.connection.execute(
+                "SELECT count(*) n FROM rack_change_steps WHERE change_id=? AND revision=? AND state='done'",
+                (change_id, row["revision"]),
+            ).fetchone()["n"]
+            rolled_back = remaining == 0
+            if rolled_back:
+                self._release_reservations(change_id, row["revision"])
+                self._set_state(change_id, row["revision"], "rolled_back")
+            self._audit(
+                "rack_change",
+                change_id,
+                "rack_change.step_rolled_back",
+                actor_id,
+                {"revision": row["revision"], "sequence": sequence, "rolled_back": rolled_back},
+            )
+        return self.rack_change(change_id, row["revision"])
+
+    def resolve_manual_takeover(
+        self,
+        actor_id: str,
+        change_id: str,
+        outcome: str,
+        note: str,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "rack_change.approve")
+        if outcome not in {"complete", "release"}:
+            raise ValidationFailed("outcome 必须是 complete 或 release")
+        if not isinstance(note, str) or not note.strip():
+            raise ValidationFailed("人工接管结论必须记录依据")
+        with transaction(self.connection, immediate=True):
+            row = self._revision_row(change_id, None)
+            if row["state"] != "manual_takeover":
+                raise InvalidState("变更不处于人工接管状态")
+            if row["submitted_by"] == actor_id:
+                raise Forbidden("申请人不能决定自己变更的人工接管结论")
+            if outcome == "complete":
+                self.connection.execute(
+                    "UPDATE rack_change_steps SET state='manual' WHERE change_id=? AND revision=? AND state IN ('pending','failed')",
+                    (change_id, row["revision"]),
+                )
+                self._consume_reservations(change_id, row["revision"])
+                self._set_state(change_id, row["revision"], "completed", row["fail_reason"])
+            else:
+                self.connection.execute(
+                    "UPDATE rack_change_steps SET state='rolled_back' WHERE change_id=? AND revision=? AND state='done'",
+                    (change_id, row["revision"]),
+                )
+                self.connection.execute(
+                    "UPDATE rack_change_steps SET state='skipped' WHERE change_id=? AND revision=? AND state='pending'",
+                    (change_id, row["revision"]),
+                )
+                self._release_reservations(change_id, row["revision"])
+                self._set_state(change_id, row["revision"], "rolled_back")
+            self.connection.execute(
+                "UPDATE rack_changes SET decision_by=?,decision_at=?,decision_basis=? WHERE change_id=? AND revision=?",
+                (actor_id, self._now(), f"人工接管：{note.strip()}", change_id, row["revision"]),
+            )
+            self._audit(
+                "rack_change",
+                change_id,
+                "rack_change.manual_resolved",
+                actor_id,
+                {"revision": row["revision"], "outcome": outcome, "note": note.strip()},
+            )
+        return self.rack_change(change_id, row["revision"])
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','facilities')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,6 +194,112 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+-- 设施约束容量目录：电力、制冷、承重与各类型网络端口的总量/已用/预留。
+CREATE TABLE IF NOT EXISTS facility_constraints (
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    constraint_key TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    capacity TEXT NOT NULL,
+    used TEXT NOT NULL DEFAULT '0',
+    reserved TEXT NOT NULL DEFAULT '0',
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(facility_id, constraint_key)
+);
+
+-- 机柜上架变更：每次修订写新版本行，(change_id, revision) 唯一，串成修订链。
+CREATE TABLE IF NOT EXISTS rack_changes (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    title TEXT NOT NULL,
+    bom_version TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'submitted'
+        CHECK(state IN ('submitted','rejected','superseded','approved','in_progress',
+                        'failed','rolling_back','manual_takeover','completed','rolled_back','cancelled')),
+    window_starts_at TEXT NOT NULL,
+    window_ends_at TEXT NOT NULL,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    supersedes_revision INTEGER,
+    decision_by TEXT REFERENCES supply_users(user_id),
+    decision_at TEXT,
+    decision_basis TEXT,
+    impact_json TEXT NOT NULL,
+    impact_built_at TEXT NOT NULL,
+    snapshot_sha256 TEXT NOT NULL,
+    fail_reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(change_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rack_changes_facility
+ON rack_changes(facility_id, state);
+
+CREATE INDEX IF NOT EXISTS idx_rack_changes_state
+ON rack_changes(facility_id, change_id, revision);
+
+-- 单个修订对各约束维度的需求与批准时的快照余量（用于接口展示与完成时转已用）。
+CREATE TABLE IF NOT EXISTS rack_change_demands (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    constraint_key TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    required_value TEXT NOT NULL,
+    -- 批准时记录的快照值，仅 completed 版本有值。
+    snapshot_capacity TEXT,
+    snapshot_used TEXT,
+    snapshot_reserved TEXT,
+    FOREIGN KEY(change_id, revision) REFERENCES rack_changes(change_id, revision) DEFERRABLE INITIALLY DEFERRED,
+    PRIMARY KEY(change_id, revision, constraint_key)
+);
+
+-- 单个修订的机柜 U 位需求。
+CREATE TABLE IF NOT EXISTS rack_change_locations (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    rack_id TEXT NOT NULL,
+    u_start INTEGER NOT NULL,
+    u_size INTEGER NOT NULL,
+    FOREIGN KEY(change_id, revision) REFERENCES rack_changes(change_id, revision) DEFERRABLE INITIALLY DEFERRED,
+    PRIMARY KEY(change_id, revision, rack_id, u_start)
+);
+
+-- 现场实施步骤：每个步骤独立回执，不允许跳步。
+CREATE TABLE IF NOT EXISTS rack_change_steps (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    rollback_action TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(state IN ('pending','done','skipped','failed','rolled_back','manual')),
+    receipt_by TEXT REFERENCES supply_users(user_id),
+    receipt_note TEXT,
+    completed_at TEXT,
+    FOREIGN KEY(change_id, revision) REFERENCES rack_changes(change_id, revision) DEFERRABLE INITIALLY DEFERRED,
+    PRIMARY KEY(change_id, revision, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rack_steps_state
+ON rack_change_steps(change_id, revision, state);
+
+-- 资源预留（锁定）台账：批准即按需求锁定，回退完成释放，全部步骤成功后转入已用。
+CREATE TABLE IF NOT EXISTS rack_change_reservations (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    facility_id TEXT NOT NULL,
+    constraint_key TEXT NOT NULL,
+    reserved_value TEXT NOT NULL,
+    released_value TEXT,
+    state TEXT NOT NULL DEFAULT 'locked' CHECK(state IN ('locked','released','consumed')),
+    locked_at TEXT NOT NULL,
+    released_at TEXT,
+    PRIMARY KEY(change_id, revision, constraint_key),
+    FOREIGN KEY(change_id, revision) REFERENCES rack_changes(change_id, revision) DEFERRABLE INITIALLY DEFERRED
+);
 """
 
 
@@ -209,6 +315,13 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    # 为 0.13 之前创建的数据库补齐约束预留列。
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(facility_constraints)").fetchall()
+    }
+    if columns and "reserved" not in columns:
+        connection.execute("ALTER TABLE facility_constraints ADD COLUMN reserved TEXT NOT NULL DEFAULT '0'")
 
 
 @contextmanager
