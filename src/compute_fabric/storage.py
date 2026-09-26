@@ -171,6 +171,107 @@ CREATE TABLE IF NOT EXISTS scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS facility_snapshots (
+    site_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','superseded')),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(site_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_facility_snapshots_site
+ON facility_snapshots(site_id, revision);
+
+CREATE TABLE IF NOT EXISTS rack_changes (
+    change_id TEXT PRIMARY KEY,
+    site_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    current_revision INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL CHECK(state IN (
+        'pending_approval','returned','rejected','reserved','in_progress',
+        'failed','rollback_in_progress','rolled_back','manual_takeover',
+        'completed','cancelled'
+    )),
+    snapshot_revision INTEGER NOT NULL,
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rack_changes_site_state
+ON rack_changes(site_id, state);
+
+CREATE TABLE IF NOT EXISTS rack_change_revisions (
+    change_id TEXT NOT NULL REFERENCES rack_changes(change_id),
+    revision INTEGER NOT NULL,
+    site_id TEXT NOT NULL,
+    snapshot_revision INTEGER NOT NULL,
+    device_list_version TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    totals_json TEXT NOT NULL,
+    impact_json TEXT,
+    window_starts_at TEXT NOT NULL,
+    window_ends_at TEXT NOT NULL,
+    devices_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    supersedes_revision INTEGER,
+    revision_note TEXT NOT NULL DEFAULT '',
+    submitted_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    submitted_at TEXT NOT NULL,
+    PRIMARY KEY(change_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rack_change_revisions_site
+ON rack_change_revisions(site_id, state);
+
+CREATE TABLE IF NOT EXISTS change_approvals (
+    approval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('approved','returned','rejected')),
+    decided_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    comment TEXT NOT NULL,
+    basis_json TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    UNIQUE(change_id, revision, decision),
+    FOREIGN KEY(change_id, revision) REFERENCES rack_change_revisions(change_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS change_locks (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    site_id TEXT NOT NULL,
+    dimension TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('site','rack','port')),
+    scope_key TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    locked_at TEXT NOT NULL,
+    PRIMARY KEY(change_id, revision, dimension, scope, scope_key),
+    FOREIGN KEY(change_id, revision) REFERENCES rack_change_revisions(change_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_locks_site
+ON change_locks(site_id, dimension, scope_key);
+
+CREATE TABLE IF NOT EXISTS change_step_receipts (
+    change_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('execution','rollback')),
+    step_index INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','done','failed','skipped')),
+    recorded_by TEXT,
+    recorded_at TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(change_id, revision, phase, step_index),
+    FOREIGN KEY(change_id, revision) REFERENCES rack_change_revisions(change_id, revision)
+);
+
 CREATE TABLE IF NOT EXISTS supply_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
@@ -198,7 +299,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(
+        str(path), isolation_level=None, timeout=10, check_same_thread=False
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

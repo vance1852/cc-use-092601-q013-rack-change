@@ -30,7 +30,59 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "fabric-recovery", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"fabric-a-b": "20"}, "demand_changes": {"cluster-a:gpu-h100": "-5"}})
     service.approve_scenario("risk", "fabric-recovery", 1)
     scenario = service.run_scenario("plan", "fabric-recovery", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+
+    # 机柜上架变更：设施快照 -> 影响分析 -> 整体审批 -> 锁定余量 -> 分步回执 -> 失败回退
+    service.register_facility_snapshot("plan", {
+        "site_id": "cluster-a", "name": "北部数据中心",
+        "power_limit_kw": "120", "cooling_limit_kw": "150", "weight_limit_kg": "6000",
+        "baseline_power_kw": "40", "baseline_cooling_kw": "50", "baseline_weight_kg": "2000",
+        "racks": [{
+            "rack_id": "rack-01", "u_size": 42, "weight_limit_kg": "1200",
+            "power_limit_kw": "25", "max_heat_class": "LIQUID",
+            "baseline_u": [{
+                "u_start": 1, "u_size": 2, "label": "core-switch",
+                "weight_kg": "30", "peak_power_kw": "0.6", "heat_class": "AIR",
+            }],
+        }],
+        "port_pools": [
+            {"port_type": "100g", "total": 48, "baseline_used": 8},
+            {"port_type": "25g", "total": 96, "baseline_used": 20},
+        ],
+    })
+    curve = ["2.5"] * 8 + ["5.0"] * 8 + ["3.5"] * 8
+    rack_change = {
+        "change_id": "rack-chg-001", "title": "H100 节点上架", "site_id": "cluster-a",
+        "device_list_version": "bom-2026-09-26",
+        "devices": [{
+            "asset_id": "gpu-node-01", "model": "H100-node", "rack_id": "rack-01",
+            "u_start": 3, "u_size": 4, "power_curve": curve, "cooling_load_kw": "5.5",
+            "weight_kg": "90", "heat_class": "LIQUID", "ports": {"100g": 2, "25g": 1},
+        }],
+        "window_starts_at": "2026-09-27T01:00:00Z", "window_ends_at": "2026-09-27T05:00:00Z",
+        "execution_steps": [
+            {"code": "prep", "title": "机柜与配电准备"},
+            {"code": "mount", "title": "设备上架固定"},
+            {"code": "cable", "title": "线缆连接与上线验证"},
+        ],
+        "rollback_plan": {
+            "trigger_notes": "上架或上线验证失败立即停止并下架恢复",
+            "steps": [{"code": "unmount", "title": "下架设备并恢复 U 位", "instruction": "断电、拆线、下架、恢复配电标签"}],
+        },
+    }
+    service.submit_rack_change("dispatch", rack_change)
+    service.decide_rack_change("risk", "rack-chg-001", "approved", "窗口、预留与回退方案齐备")
+    service.start_rack_execution("dispatch", "rack-chg-001")
+    service.record_execution_step("dispatch", "rack-chg-001", 0, True, "准备完成")
+    service.record_execution_step("dispatch", "rack-chg-001", 1, False, "现场发现导轨规格不符")
+    service.begin_rollback("dispatch", "rack-chg-001")
+    rolled_back = service.record_rollback_step("dispatch", "rack-chg-001", 0, True, "已下架恢复")
+    rack_summary = {
+        "state": rolled_back["state"],
+        "revision": rolled_back["current_revision"],
+        "power_remaining": service.site_capacity("cluster-a")["site_constraints"]["power_kw"]["remaining"],
+    }
+
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "rack_change": rack_summary, "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

@@ -63,6 +63,42 @@ class JsonApplication:
                 return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
             if method == "POST" and path == "/facilities":
                 return Response(201, self.service.create_facility(actor, payload))
+            if method == "POST" and path == "/facility/snapshots":
+                return Response(201, self.service.register_facility_snapshot(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["facility", "snapshots"]:
+                revision = query.get("revision")
+                return Response(200, self.service.facility_snapshot(parts[2], int(revision[0]) if revision else None))
+            if method == "GET" and len(parts) == 3 and parts[0] == "facility" and parts[2] == "capacity":
+                return Response(200, self.service.site_capacity(parts[1]))
+            if method == "POST" and path == "/rack-changes":
+                return Response(201, self.service.submit_rack_change(actor, payload))
+            if method == "GET" and path == "/rack-changes":
+                return Response(200, self.service.list_rack_changes(query.get("site_id", [None])[0]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "rack-changes":
+                return Response(200, self.service.rack_change(parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "revise":
+                return Response(200, self.service.revise_rack_change(actor, parts[1], payload, str(payload.get("note", ""))))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "decision":
+                return Response(200, self.service.decide_rack_change(
+                    actor, parts[1], payload["decision"], payload.get("comment", ""),
+                    payload.get("expected_revision"),
+                ))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "start":
+                return Response(200, self.service.start_rack_execution(actor, parts[1]))
+            if method == "POST" and len(parts) == 4 and parts[0] == "rack-changes" and parts[2] == "rollback" and parts[3] == "start":
+                return Response(200, self.service.begin_rollback(actor, parts[1]))
+            if method == "POST" and len(parts) == 4 and parts[0] == "rack-changes" and parts[2] == "rollback" and parts[3] == "steps":
+                return Response(200, self.service.record_rollback_step(
+                    actor, parts[1], int(payload["step_index"]), bool(payload["success"]), str(payload.get("note", ""))
+                ))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "steps":
+                return Response(200, self.service.record_execution_step(
+                    actor, parts[1], int(payload["step_index"]), bool(payload["success"]), str(payload.get("note", ""))
+                ))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "manual-takeover":
+                return Response(200, self.service.manual_takeover(actor, parts[1], str(payload.get("note", ""))))
+            if method == "POST" and len(parts) == 3 and parts[0] == "rack-changes" and parts[2] == "cancel":
+                return Response(200, self.service.cancel_rack_change(actor, parts[1]))
             if method == "POST" and path == "/routes":
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
